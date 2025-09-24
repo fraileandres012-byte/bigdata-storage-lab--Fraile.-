@@ -107,3 +107,38 @@ def to_silver(bronze: pd.DataFrame) -> pd.DataFrame:
 
     # Orden estándar de columnas
     return grouped[["partner", "month", "amount"]]
+    # src/transform.py (debajo de to_silver)
+import pandas as pd
+
+def to_gold(silver: pd.DataFrame, bronze: pd.DataFrame) -> pd.DataFrame:
+    """
+    GOLD (partner × month) para reporting:
+      - partner, month, amount_total
+      - last_update: max(ingested_at) en bronze para ese partner×month
+      - sources: lista única de source_file separados por '|'
+    """
+    if silver.empty:
+        return pd.DataFrame(columns=["partner", "month", "amount_total", "last_update", "sources"])
+
+    # Agregado principal
+    g = (
+        silver.groupby(["partner", "month"], as_index=False)["amount"]
+        .sum(min_count=1)
+        .rename(columns={"amount": "amount_total"})
+    )
+
+    # Linaje desde bronze
+    b = bronze.copy()
+    b["month"] = pd.to_datetime(b["date"], errors="coerce").dt.to_period("M").dt.to_timestamp("start")
+
+    lin = (
+        b.groupby(["partner", "month"], as_index=False)
+        .agg(
+            last_update=("ingested_at", "max"),
+            sources=("source_file", lambda s: "|".join(sorted(pd.Series(s).dropna().unique())))
+        )
+    )
+
+    gold = g.merge(lin, on=["partner", "month"], how="left")
+    return gold[["partner", "month", "amount_total", "last_update", "sources"]]
+
