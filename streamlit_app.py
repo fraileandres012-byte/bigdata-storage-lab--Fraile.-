@@ -202,6 +202,22 @@ if not errors:
         file_name="silver.csv",
         mime="text/csv",
     )
+    from src.transform import to_gold  # (si no estaba importado)
+
+# ...
+gold = to_gold(silver, bronze)
+st.subheader("Gold (partner × mes, con linaje)")
+st.dataframe(gold, use_container_width=True)
+
+# Descarga gold
+gold_csv = df_to_csv_bytes(gold)
+st.download_button(
+    label="⬇️ Descargar gold.csv",
+    data=gold_csv,
+    file_name="gold.csv",
+    mime="text/csv",
+)
+
 
 # ---------- Notas finales ----------
 with st.expander("Notas y supuestos", expanded=False):
