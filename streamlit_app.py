@@ -1,12 +1,21 @@
 # streamlit_app.py
 # App sobria para: subir múltiples CSV, normalizar a esquema canónico,
 # validar, consolidar bronze y derivar silver con KPIs y gráfico.
-# Requiere los módulos del repo:
-#   - src/transform.py  (normalize_columns, to_silver)
-#   - src/validate.py   (basic_checks)
-#   - src/ingest.py     (tag_lineage, concat_bronze)
+# Incluye un parche defensivo de rutas para evitar "ModuleNotFoundError: No module named 'src'".
 
 from __future__ import annotations
+
+# --- Patch defensivo de ruta para encontrar /src ---
+import os
+import sys
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.join(ROOT_DIR, "src")
+
+for p in (ROOT_DIR, SRC_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+# --- Fin del patch ---
 
 import io
 from typing import List, Dict
@@ -14,9 +23,15 @@ from typing import List, Dict
 import pandas as pd
 import streamlit as st
 
-from src.transform import normalize_columns, to_silver
-from src.validate import basic_checks
-from src.ingest import tag_lineage, concat_bronze
+# Intento de import con prefijo `src.` y, en fallback, sin prefijo
+try:
+    from src.transform import normalize_columns, to_silver
+    from src.validate import basic_checks
+    from src.ingest import tag_lineage, concat_bronze
+except ModuleNotFoundError:
+    from transform import normalize_columns, to_silver
+    from validate import basic_checks
+    from ingest import tag_lineage, concat_bronze
 
 
 # ---------- Utilidades ----------
@@ -25,17 +40,16 @@ def read_csv_with_fallback(uploaded_file) -> pd.DataFrame:
     Lee un CSV intentando primero UTF-8 y luego latin-1 (fallback).
     uploaded_file es un st.uploaded_file_manager.UploadedFile.
     """
-    # Rewind por si se reutiliza el buffer
     uploaded_file.seek(0)
     try:
         return pd.read_csv(uploaded_file)
     except UnicodeDecodeError:
         uploaded_file.seek(0)
-        # Fallback: latin-1 con reemplazo de caracteres problemáticos
         return pd.read_csv(uploaded_file, encoding="latin-1")
 
+
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    """Convierte un DataFrame a CSV en memoria (UTF-8, con BOM opcional si se desea)."""
+    """Convierte un DataFrame a CSV en memoria (UTF-8)."""
     buf = io.StringIO()
     df.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
@@ -55,9 +69,9 @@ st.caption("Sube múltiples CSV, normaliza columnas, valida y genera capas bronz
 with st.sidebar:
     st.header("Configuración de columnas origen")
     st.write("Indica cómo se llaman en tus CSV las columnas que corresponden a:")
-    col_date = st.text_input("Columna de fecha (→ `date`)", value="date", help="Ejemplos comunes: fecha, transaction_date, date")
-    col_partner = st.text_input("Columna de partner (→ `partner`)", value="partner", help="Ejemplos comunes: cliente, vendor_name, partner")
-    col_amount = st.text_input("Columna de importe (→ `amount`)", value="amount", help="Ejemplos comunes: importe, total_amount, amount")
+    col_date = st.text_input("Columna de fecha (→ `date`)", value="date", help="Ejemplos: fecha, transaction_date, date")
+    col_partner = st.text_input("Columna de partner (→ `partner`)", value="partner", help="Ejemplos: cliente, vendor_name, partner")
+    col_amount = st.text_input("Columna de importe (→ `amount`)", value="amount", help="Ejemplos: importe, total_amount, amount")
     st.markdown("---")
     st.write("**Instrucciones rápidas**")
     st.write("- Sube uno o más CSVs en la sección principal.")
@@ -80,15 +94,13 @@ uploaded_files = st.file_uploader(
     help="Puedes arrastrar varios a la vez.",
 )
 
-# Contenedores de salida
 bronze_frames: List[pd.DataFrame] = []
-file_summaries = []
 
 if uploaded_files:
     st.subheader("Normalización y linaje por archivo")
     for up in uploaded_files:
         with st.expander(f"📄 {up.name}", expanded=False):
-            # 1) leer CSV con fallback
+            # 1) Leer CSV con fallback
             try:
                 df_raw = read_csv_with_fallback(up)
             except Exception as e:
@@ -98,14 +110,14 @@ if uploaded_files:
             st.write("Vista previa (primeras filas):")
             st.dataframe(df_raw.head(10), use_container_width=True)
 
-            # 2) normalizar columnas al canónico
+            # 2) Normalizar columnas al canónico
             try:
                 df_norm = normalize_columns(df_raw, mapping)
             except Exception as e:
                 st.error(f"Error normalizando `{up.name}`: {e}")
                 continue
 
-            # 3) anotar linaje
+            # 3) Anotar linaje
             df_tagged = tag_lineage(df_norm, source_name=up.name)
             bronze_frames.append(df_tagged)
 
@@ -143,14 +155,14 @@ st.download_button(
     mime="text/csv",
 )
 
-# Si validaciones OK, derivar silver y mostrar KPIs
+# ---------- Silver, KPIs y gráfico ----------
 if not errors:
-    # ---------- Silver ----------
+    # Silver
     silver = to_silver(bronze)
     st.subheader("Silver (partner × mes)")
     st.dataframe(silver, use_container_width=True)
 
-    # ---------- KPIs simples ----------
+    # KPIs simples
     st.subheader("KPIs")
     kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
 
@@ -169,7 +181,7 @@ if not errors:
             rango = f"{date_min.date().isoformat()} → {date_max.date().isoformat()}"
         st.metric("Rango de fechas", rango)
 
-    # ---------- Gráfico mensual (simple) ----------
+    # Gráfico mensual (sobrio, sin estilos custom)
     st.subheader("Tendencia mensual (importe total)")
     if not silver.empty:
         monthly = (
@@ -177,13 +189,12 @@ if not errors:
             .sum(min_count=1)
             .sort_values("month")
         )
-        # st.bar_chart acepta un DataFrame; usamos month como índice si procede
         chart_df = monthly.set_index("month")
         st.bar_chart(chart_df["amount"])
     else:
         st.info("No hay datos en silver para graficar.")
 
-    # ---------- Descarga silver ----------
+    # Descarga silver
     silver_csv = df_to_csv_bytes(silver)
     st.download_button(
         label="⬇️ Descargar silver.csv",
