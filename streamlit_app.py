@@ -1,7 +1,7 @@
 # streamlit_app.py
 # App sobria para: subir múltiples CSV, normalizar a esquema canónico,
-# validar, consolidar bronze y derivar silver con KPIs y gráfico.
-# Incluye un parche defensivo de rutas para evitar "ModuleNotFoundError: No module named 'src'".
+# validar, consolidar bronze y derivar silver/gold con KPIs y gráfico.
+# Incluye parche defensivo de rutas para evitar errores de import.
 
 from __future__ import annotations
 
@@ -23,13 +23,13 @@ from typing import List, Dict
 import pandas as pd
 import streamlit as st
 
-# Intento de import con prefijo `src.` y, en fallback, sin prefijo
+# Imports desde src (con fallback si el paquete no se detecta)
 try:
-    from src.transform import normalize_columns, to_silver
-    from src.validate import basic_checks
+    from src.transform import normalize_columns, to_silver, to_gold
+    from src.validate import basic_checks  # si tienes versión extendida, también sirve
     from src.ingest import tag_lineage, concat_bronze
 except ModuleNotFoundError:
-    from transform import normalize_columns, to_silver
+    from transform import normalize_columns, to_silver, to_gold
     from validate import basic_checks
     from ingest import tag_lineage, concat_bronze
 
@@ -57,13 +57,13 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 # ---------- Configuración de página ----------
 st.set_page_config(
-    page_title="CSV → Bronze/Silver",
+    page_title="CSV → Bronze/Silver/Gold",
     page_icon="📦",
     layout="wide",
 )
 
 st.title("De CSVs heterogéneos a un almacén analítico confiable")
-st.caption("Sube múltiples CSV, normaliza columnas, valida y genera capas bronze/silver con KPIs.")
+st.caption("Sube múltiples CSV, normaliza columnas, valida y genera capas bronze/silver/gold con KPIs.")
 
 # ---------- Sidebar: mapping y ayuda ----------
 with st.sidebar:
@@ -73,10 +73,8 @@ with st.sidebar:
     col_partner = st.text_input("Columna de partner (→ `partner`)", value="partner", help="Ejemplos: cliente, vendor_name, partner")
     col_amount = st.text_input("Columna de importe (→ `amount`)", value="amount", help="Ejemplos: importe, total_amount, amount")
     st.markdown("---")
-    st.write("**Instrucciones rápidas**")
-    st.write("- Sube uno o más CSVs en la sección principal.")
-    st.write("- Ajusta los nombres de columnas si difieren en tus archivos.")
-    st.write("- Revisa validaciones y descarga los resultados.")
+    st.write("**Instrucciones**")
+    st.write("1) Sube CSVs. 2) Ajusta mapeo. 3) Revisa validaciones. 4) Descarga bronze/silver/gold.")
 
 mapping: Dict[str, str] = {}
 if col_date.strip():
@@ -155,7 +153,7 @@ st.download_button(
     mime="text/csv",
 )
 
-# ---------- Silver, KPIs y gráfico ----------
+# ---------- Silver, KPIs, gráfico y GOLD ----------
 if not errors:
     # Silver
     silver = to_silver(bronze)
@@ -194,7 +192,12 @@ if not errors:
     else:
         st.info("No hay datos en silver para graficar.")
 
-    # Descarga silver
+    # GOLD (partner × month) con linaje
+    st.subheader("Gold (partner × mes, con linaje)")
+    gold = to_gold(silver, bronze)
+    st.dataframe(gold, use_container_width=True)
+
+    # Descargas
     silver_csv = df_to_csv_bytes(silver)
     st.download_button(
         label="⬇️ Descargar silver.csv",
@@ -202,22 +205,14 @@ if not errors:
         file_name="silver.csv",
         mime="text/csv",
     )
-    from src.transform import to_gold  # (si no estaba importado)
 
-# ...
-gold = to_gold(silver, bronze)
-st.subheader("Gold (partner × mes, con linaje)")
-st.dataframe(gold, use_container_width=True)
-
-# Descarga gold
-gold_csv = df_to_csv_bytes(gold)
-st.download_button(
-    label="⬇️ Descargar gold.csv",
-    data=gold_csv,
-    file_name="gold.csv",
-    mime="text/csv",
-)
-
+    gold_csv = df_to_csv_bytes(gold)
+    st.download_button(
+        label="⬇️ Descargar gold.csv",
+        data=gold_csv,
+        file_name="gold.csv",
+        mime="text/csv",
+    )
 
 # ---------- Notas finales ----------
 with st.expander("Notas y supuestos", expanded=False):
@@ -228,6 +223,7 @@ with st.expander("Notas y supuestos", expanded=False):
 - La **fecha** se normaliza a tipo datetime y se usa el **inicio de mes** para la agregación mensual.
 - **Bronze** incluye linaje (`source_file`, `ingested_at` UTC).
 - **Silver** agrega por `partner` y `month`.
+- **Gold** resume `amount_total` y conserva linaje vía `last_update` (máxima ingesta involucrada) y `sources` (orígenes únicos).
 - Los **botones de descarga** generan CSV a partir de las tablas mostradas.
         """
     )
