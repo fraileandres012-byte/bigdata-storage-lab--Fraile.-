@@ -61,10 +61,16 @@ def normalize_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame
         if col not in out.columns:
             out[col] = pd.NA
 
-    # Parseo de fecha a datetime (naive, normalizada a 00:00:00)
-    out["date"] = pd.to_datetime(out["date"], errors="coerce", utc=False)
-    # Normalizar a medianoche para consistencia (solo fecha)
-    out["date"] = out["date"].dt.normalize()
+    raw_date = out["date"].astype("string")
+
+# 1º intento: inferencia general
+parsed = pd.to_datetime(raw_date, errors="coerce", utc=False, infer_datetime_format=True)
+
+# 2º intento (fallback): si parece formato con barras, probar dayfirst=True
+mask_slash = raw_date.str.contains(r"\d{1,2}/\d{1,2}/\d{2,4}")
+parsed = parsed.fillna(pd.to_datetime(raw_date.where(mask_slash), errors="coerce", dayfirst=True))
+
+out["date"] = parsed.dt.normalize()
 
     # Limpieza de partner
     out["partner"] = out["partner"].astype("string").str.strip()
