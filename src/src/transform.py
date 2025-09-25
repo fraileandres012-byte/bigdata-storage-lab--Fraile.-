@@ -6,31 +6,25 @@ import pandas as pd
 def _clean_amount_to_float(x: object) -> float:
     """
     Convierte montos con formatos europeos/mixtos a float (EUR).
-    Ejemplos válidos: "1.234,56", "1,234.56", "€1.234,56", "- 2.500", "2500", "2,5"
-    Regla:
-      - Si hay ',' y '.', asumimos ',' como separador decimal y eliminamos los '.'
-      - Si solo hay ',', se interpreta como decimal y se reemplaza por '.'
-      - Si solo hay '.', se deja como está
+    Soporta: "1.234,56", "1,234.56", "€1.234,56", "- 2.500", "2500", "2,5"
     """
     if pd.isna(x):
         return float("nan")
     s = str(x).strip()
 
-    # quitar símbolo de euro y espacios interiores extras
+    # quitar símbolos y espacios
     s = s.replace("€", "").replace("EUR", "").strip()
     s = re.sub(r"\s+", "", s)
-
-    # mantener solo dígitos, signos, puntos y comas
+    # permitir dígitos/signo/puntos/comas
     s = re.sub(r"[^0-9\-,\.]", "", s)
 
     if s.count(",") > 0 and s.count(".") > 0:
-        # formato europeo típico: 1.234,56 -> 1234,56 -> 1234.56
-        s = s.replace(".", "")
-        s = s.replace(",", ".")
+        # 1.234,56 -> 1234.56
+        s = s.replace(".", "").replace(",", ".")
     elif s.count(",") > 0 and s.count(".") == 0:
-        # solo coma -> decimal
+        # 2,5 -> 2.5
         s = s.replace(",", ".")
-    # si solo hay punto, no hacemos nada
+    # si solo hay punto, se deja
 
     try:
         return float(s)
@@ -40,73 +34,60 @@ def _clean_amount_to_float(x: object) -> float:
 
 def normalize_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
     """
-    Normaliza un DataFrame a esquema canónico: date (datetime), partner (str), amount (float EUR).
-    - Renombra columnas según `mapping` {col_origen: "date"/"partner"/"amount"}.
-    - Parsea fechas a datetime (ISO, normalizadas a medianoche).
-    - Normaliza amount (quita € y comas europeas) a float.
-    - Limpia espacios en `partner`.
-
-    Args:
-        df: DataFrame original.
-        mapping: Mapeo origen→canónico. Ej: {"fecha": "date", "cliente": "partner", "importe": "amount"}.
-
-    Returns:
-        DataFrame con columnas canónicas: ["date", "partner", "amount"].
+    Normaliza a canónico: date (datetime), partner (str), amount (float EUR).
+    - Renombra columnas según mapping {origen: canónico}.
+    - Parsea fechas con fallback day-first para DD/MM/YYYY.
+    - Limpia partner (espacios múltiples).
+    - Normaliza amount.
     """
-    # Renombrar según mapping
     out = df.rename(columns=mapping).copy()
 
-    # Asegurar columnas canónicas existan (aunque vacías)
+    # Asegurar columnas canónicas
     for col in ("date", "partner", "amount"):
         if col not in out.columns:
             out[col] = pd.NA
 
-   # out["date"] = pd.to_datetime(out["date"], errors="coerce", utc=False)
-# out["date"] = out["date"].dt.normalize()
+    # --- Fecha robusta ---
+    raw_date = out["date"].astype("string").str.strip()
 
-    # Limpieza de partner
+    # 1º intento: inferencia general
+    parsed = pd.to_datetime(raw_date, errors="coerce", utc=False, infer_datetime_format=True)
+
+    # 2º intento: formatos con barras -> dayfirst (DD/MM/YYYY)
+    mask_slash = raw_date.str.contains(r"\d{1,2}/\d{1,2}/\d{2,4}", na=False)
+    parsed = parsed.fillna(pd.to_datetime(raw_date.where(mask_slash), errors="coerce", dayfirst=True))
+
+    # Normalizar a medianoche (solo fecha)
+    out["date"] = parsed.dt.normalize()
+
+    # Partner
     out["partner"] = out["partner"].astype("string").str.strip()
-    # Colapsar espacios múltiples
     out["partner"] = out["partner"].str.replace(r"\s+", " ", regex=True)
 
-    # Normalización de amount a float EUR
+    # Amount
     out["amount"] = out["amount"].apply(_clean_amount_to_float)
 
-    # Devolver solo canónicas
     return out[["date", "partner", "amount"]]
 
 
 def to_silver(bronze: pd.DataFrame) -> pd.DataFrame:
     """
-    Agrega amount por partner y mes. La columna `month` se entrega como timestamp
-    (inicio de mes), derivado de un Period('M').
-
-    Args:
-        bronze: DataFrame canónico/bronze con columnas ["date", "partner", "amount"].
-
-    Returns:
-        DataFrame con columnas: ["partner", "month", "amount"].
+    Agrega amount por partner y mes (month = inicio de mes).
     """
     df = bronze.copy()
-    # Asegurar tipos esperados
     df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=False)
     df["partner"] = df["partner"].astype("string")
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
 
-    # Mes como Period mensual y luego a timestamp (inicio de mes)
-    month_period = df["date"].dt.to_period("M")
-    month_ts = month_period.dt.to_timestamp(how="start")
+    month_ts = df["date"].dt.to_period("M").dt.to_timestamp(how="start")
 
     grouped = (
         df.assign(month=month_ts)
         .groupby(["partner", "month"], dropna=True, as_index=False, observed=True)["amount"]
-        .sum(min_count=1)  # si todo es NaN, queda NaN
+        .sum(min_count=1)
     )
-
-    # Orden estándar de columnas
     return grouped[["partner", "month", "amount"]]
-    # src/transform.py (debajo de to_silver)
-import pandas as pd
+
 
 def to_gold(silver: pd.DataFrame, bronze: pd.DataFrame) -> pd.DataFrame:
     """
@@ -118,14 +99,12 @@ def to_gold(silver: pd.DataFrame, bronze: pd.DataFrame) -> pd.DataFrame:
     if silver.empty:
         return pd.DataFrame(columns=["partner", "month", "amount_total", "last_update", "sources"])
 
-    # Agregado principal
     g = (
         silver.groupby(["partner", "month"], as_index=False)["amount"]
         .sum(min_count=1)
         .rename(columns={"amount": "amount_total"})
     )
 
-    # Linaje desde bronze
     b = bronze.copy()
     b["month"] = pd.to_datetime(b["date"], errors="coerce").dt.to_period("M").dt.to_timestamp("start")
 
@@ -133,10 +112,9 @@ def to_gold(silver: pd.DataFrame, bronze: pd.DataFrame) -> pd.DataFrame:
         b.groupby(["partner", "month"], as_index=False)
         .agg(
             last_update=("ingested_at", "max"),
-            sources=("source_file", lambda s: "|".join(sorted(pd.Series(s).dropna().unique())))
+            sources=("source_file", lambda s: "|".join(sorted(pd.Series(s).dropna().unique()))),
         )
     )
 
     gold = g.merge(lin, on=["partner", "month"], how="left")
     return gold[["partner", "month", "amount_total", "last_update", "sources"]]
-
