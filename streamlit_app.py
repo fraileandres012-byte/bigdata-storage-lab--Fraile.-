@@ -1,23 +1,22 @@
-# streamlit_app.py
-# App para: subir múltiples CSV, autodetectar columnas por archivo,
-# normalizar → validar → consolidar Bronze → derivar Silver/Gold, KPIs y gráfico.
-# Cabecera de imports ultrarrobusta (paquete, sys.path y carga por ruta).
+# App: múltiples CSV heterogéneos → Bronze/Silver/Gold
+# - Autodetección por archivo (sinónimos)
+# - Parseo de fechas robusto (en transform.py)
+# - Diagnóstico y limpieza opcional de filas inválidas
+# - Imports a prueba de balas (paquete, sys.path y por ruta)
 
 from __future__ import annotations
 
-# --- Rutas base ---
+# --- Rutas base e imports ultrarrobustos ---
 import os
 import sys
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
 
-# --- Intento 1: importar como paquete src. ---
 try:
     from src.transform import normalize_columns, to_silver, to_gold  # type: ignore
     from src.validate import basic_checks  # type: ignore
     from src.ingest import tag_lineage, concat_bronze  # type: ignore
 except ModuleNotFoundError:
-    # --- Intento 2: forzar sys.path y reintentar como módulos planos ---
     for p in (ROOT_DIR, SRC_DIR):
         if p not in sys.path:
             sys.path.insert(0, p)
@@ -26,41 +25,39 @@ except ModuleNotFoundError:
         from validate import basic_checks  # type: ignore
         from ingest import tag_lineage, concat_bronze  # type: ignore
     except ModuleNotFoundError:
-        # --- Intento 3: carga por ruta absoluta con importlib ---
         import importlib.util
 
-        def _load_module(mod_name: str, file_path: str):
-            if not os.path.exists(file_path):
-                raise ModuleNotFoundError(f"No se encontró {file_path}. ¿Está src/ en la raíz del repo?")
-            spec = importlib.util.spec_from_file_location(mod_name, file_path)
+        def _load(mod_name: str, path: str):
+            if not os.path.exists(path):
+                raise ModuleNotFoundError(f"No se encontró {path}. ¿Está src/ en la raíz del repo?")
+            spec = importlib.util.spec_from_file_location(mod_name, path)
             if spec is None or spec.loader is None:
-                raise ModuleNotFoundError(f"No se pudo crear spec para {file_path}")
+                raise ModuleNotFoundError(f"No se pudo cargar {path}")
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)  # type: ignore[attr-defined]
             sys.modules[mod_name] = mod
             return mod
 
-        _t = _load_module("transform", os.path.join(SRC_DIR, "transform.py"))
-        _v = _load_module("validate", os.path.join(SRC_DIR, "validate.py"))
-        _i = _load_module("ingest", os.path.join(SRC_DIR, "ingest.py"))
+        _t = _load("transform", os.path.join(SRC_DIR, "transform.py"))
+        _v = _load("validate", os.path.join(SRC_DIR, "validate.py"))
+        _i = _load("ingest", os.path.join(SRC_DIR, "ingest.py"))
 
         normalize_columns = _t.normalize_columns
         to_silver = _t.to_silver
-        to_gold = getattr(_t, "to_gold", None)  # puede no existir si no hiciste el reto C
+        to_gold = _t.to_gold
         basic_checks = _v.basic_checks
         tag_lineage = _i.tag_lineage
         concat_bronze = _i.concat_bronze
 
-# ---- Dependencias estándar de la app ----
+# --- Dependencias estándar ---
 import io
 from typing import List, Dict
-
 import pandas as pd
 import streamlit as st
 
 # ---------- Utilidades ----------
 def read_csv_with_fallback(uploaded_file) -> pd.DataFrame:
-    """Lee un CSV intentando primero UTF-8 y luego latin-1 (fallback)."""
+    """Lee CSV, primero UTF-8 y si falla latin-1."""
     uploaded_file.seek(0)
     try:
         return pd.read_csv(uploaded_file)
@@ -81,14 +78,18 @@ st.set_page_config(page_title="CSV → Bronze/Silver/Gold", page_icon="📦", la
 st.title("De CSVs heterogéneos a un almacén analítico confiable")
 st.caption("Sube múltiples CSV, autodetecta columnas por archivo, valida y genera Bronze/Silver/Gold con KPIs.")
 
-# ---------- Sidebar: mapping global (fallback) ----------
+# ---------- Sidebar: mapping global (fallback) + limpieza ----------
 with st.sidebar:
     st.header("Mapping global (fallback)")
     col_date = st.text_input("Columna de fecha (→ `date`)", value="date")
     col_partner = st.text_input("Columna de partner (→ `partner`)", value="partner")
     col_amount = st.text_input("Columna de importe (→ `amount`)", value="amount")
     st.markdown("---")
-    st.write("Se autodetectan columnas por archivo. Si falta alguna, se usa este mapping.")
+    auto_clean = st.checkbox(
+        "Eliminar filas inválidas (date NaT o amount no numérico) antes de validar",
+        value=True,
+    )
+    st.caption("Se autodetectan columnas por archivo; si falta alguna, se usa este mapping.")
 
 fallback_mapping: Dict[str, str] = {}
 if col_date.strip():
@@ -103,7 +104,7 @@ uploaded_files = st.file_uploader(
     "Sube uno o más archivos CSV",
     type=["csv"],
     accept_multiple_files=True,
-    help="Se intentará autodetectar columnas por archivo.",
+    help="Se intentará autodetectar columnas por archivo (fecha/partner/importe).",
 )
 
 bronze_frames: List[pd.DataFrame] = []
@@ -118,14 +119,13 @@ SYNONYMS = {
 def build_auto_mapping(df_raw: pd.DataFrame, fallback: Dict[str, str]) -> Dict[str, str]:
     """Crea mapping origen→canónico por archivo: sinónimos + fallback."""
     headers = [str(c).strip() for c in df_raw.columns]
-    lower_to_orig = {c.lower(): c for c in headers}
+    low2orig = {c.lower(): c for c in headers}
     auto_map: Dict[str, str] = {}
     for target, candidates in SYNONYMS.items():
         for cand in candidates:
-            if cand.lower() in lower_to_orig:
-                auto_map[lower_to_orig[cand.lower()]] = target
+            if cand.lower() in low2orig:
+                auto_map[low2orig[cand.lower()]] = target
                 break
-    # Completar con fallback si falta alguno
     present_targets = set(auto_map.values())
     for src_col, tgt in fallback.items():
         if tgt not in present_targets and src_col in df_raw.columns:
@@ -149,20 +149,20 @@ if uploaded_files:
 
             # 2) Autodetectar mapping y normalizar
             auto_map = build_auto_mapping(df_raw, fallback_mapping)
-            missing_targets = {"date", "partner", "amount"} - set(auto_map.values())
-            if missing_targets:
+            missing = {"date", "partner", "amount"} - set(auto_map.values())
+            if missing:
                 st.warning(
-                    f"En `{up.name}` faltan columnas para: {', '.join(sorted(missing_targets))}. "
-                    f"Revisa el mapping global o renombra columnas en el CSV."
+                    f"En `{up.name}` faltan columnas para: {', '.join(sorted(missing))}. "
+                    "Revisa el mapping global o renombra columnas en el CSV."
                 )
             try:
-                df_norm = normalize_columns(df_raw, auto_map)  # type: ignore
+                df_norm = normalize_columns(df_raw, auto_map)
             except Exception as e:
                 st.error(f"Error normalizando `{up.name}`: {e}")
                 continue
 
             # 3) Linaje
-            df_tagged = tag_lineage(df_norm, source_name=up.name)  # type: ignore
+            df_tagged = tag_lineage(df_norm, source_name=up.name)
             bronze_frames.append(df_tagged)
 
             st.write("Normalizado + linaje (primeras filas):")
@@ -173,23 +173,42 @@ if not uploaded_files:
     st.stop()
 
 # ---------- Bronze unificado ----------
-bronze = concat_bronze(bronze_frames)  # type: ignore
-bronze = bronze.drop_duplicates(subset=["date", "partner", "amount"])  # limpiar duplicados exactos
+bronze = concat_bronze(bronze_frames)
+bronze = bronze.drop_duplicates(subset=["date", "partner", "amount"])
+
+# Diagnóstico previo
+date_parsed = pd.to_datetime(bronze["date"], errors="coerce", utc=False)
+amount_num = pd.to_numeric(bronze["amount"], errors="coerce")
+mask_bad_date = date_parsed.isna()
+mask_bad_amount = amount_num.isna()
+
+with st.expander("Diagnóstico de datos (antes de validaciones)", expanded=False):
+    st.write(f"Filas con **date** no parseable: {int(mask_bad_date.sum())}")
+    if mask_bad_date.any():
+        st.dataframe(bronze.loc[mask_bad_date].head(10), use_container_width=True)
+    st.write(f"Filas con **amount** no numérico: {int(mask_bad_amount.sum())}")
+    if mask_bad_amount.any():
+        st.dataframe(bronze.loc[mask_bad_amount].head(10), use_container_width=True)
+
+# Limpieza opcional
+if auto_clean and (mask_bad_date.any() or mask_bad_amount.any()):
+    bronze = bronze.loc[~(mask_bad_date | mask_bad_amount)].copy()
+    st.info("Se eliminaron filas inválidas (date NaT o amount no numérico) antes de validar.")
 
 st.subheader("Bronze unificado")
 st.dataframe(bronze, use_container_width=True)
 
 # ---------- Validaciones ----------
 st.subheader("Validaciones (basic_checks)")
-errors = basic_checks(bronze)  # type: ignore
+errors = basic_checks(bronze)
 
 if errors:
     st.error("Se han detectado problemas:")
     for err in errors:
         st.markdown(f"- {err}")
-    st.info("Corrige el mapping (global o renombrando columnas) o revisa los datos de origen y vuelve a intentarlo.")
+    st.info("Ajusta mapping o corrige el archivo de origen y vuelve a intentarlo.")
 else:
-    st.success("Validaciones OK: el conjunto bronze cumple los requisitos mínimos.")
+    st.success("Validaciones OK.")
 
 # Descargar bronze
 st.download_button(
@@ -200,47 +219,41 @@ st.download_button(
 )
 
 # ---------- Silver / Gold / KPIs ----------
-if not errors:
-    # Silver
-    silver = to_silver(bronze)  # type: ignore
+if not errors and not bronze.empty:
+    silver = to_silver(bronze)
     st.subheader("Silver (partner × mes)")
     st.dataframe(silver, use_container_width=True)
 
-    # Gold (si existe la función; si no, omite)
-    if callable(to_gold):  # type: ignore
-        gold = to_gold(silver, bronze)  # type: ignore
-        st.subheader("Gold (partner × mes, con linaje)")
-        st.dataframe(gold, use_container_width=True)
-        st.download_button(
-            label="⬇️ Descargar gold.csv",
-            data=df_to_csv_bytes(gold),
-            file_name="gold.csv",
-            mime="text/csv",
-        )
+    gold = to_gold(silver, bronze)
+    st.subheader("Gold (partner × mes, con linaje)")
+    st.dataframe(gold, use_container_width=True)
 
-    # Descargar silver
     st.download_button(
         label="⬇️ Descargar silver.csv",
         data=df_to_csv_bytes(silver),
         file_name="silver.csv",
         mime="text/csv",
     )
+    st.download_button(
+        label="⬇️ Descargar gold.csv",
+        data=df_to_csv_bytes(gold),
+        file_name="gold.csv",
+        mime="text/csv",
+    )
 
     # KPIs
     st.subheader("KPIs")
-    kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
     total_amount = pd.to_numeric(bronze["amount"], errors="coerce").sum(min_count=1)
     unique_partners = bronze["partner"].nunique(dropna=True)
     date_min = pd.to_datetime(bronze["date"], errors="coerce").min()
     date_max = pd.to_datetime(bronze["date"], errors="coerce").max()
-    with kpi_col1:
+    with c1:
         st.metric("Importe total (EUR)", f"{total_amount:,.2f}")
-    with kpi_col2:
+    with c2:
         st.metric("Partners únicos", int(unique_partners) if pd.notna(unique_partners) else 0)
-    with kpi_col3:
-        rango = "—"
-        if pd.notna(date_min) and pd.notna(date_max):
-            rango = f"{date_min.date().isoformat()} → {date_max.date().isoformat()}"
+    with c3:
+        rango = "—" if pd.isna(date_min) or pd.isna(date_max) else f"{date_min.date().isoformat()} → {date_max.date().isoformat()}"
         st.metric("Rango de fechas", rango)
 
     # Tendencia mensual
@@ -254,15 +267,3 @@ if not errors:
         st.bar_chart(monthly.set_index("month")["amount"])
     else:
         st.info("No hay datos en silver para graficar.")
-
-# ---------- Notas ----------
-with st.expander("Notas y supuestos", expanded=False):
-    st.markdown(
-        """
-- Autodetección de columnas por archivo (sinónimos) con fallback de la barra lateral.
-- Fechas normalizadas y formatos europeos de importe soportados.
-- Bronze con linaje (`source_file`, `ingested_at`) y deduplicación exacta.
-- Silver agrega por `partner` y `month`.
-- Gold añade `last_update` y `sources` (si implementado).
-        """
-    )
